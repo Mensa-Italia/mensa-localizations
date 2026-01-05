@@ -24,9 +24,11 @@ WORKDIR /
 
 RUN apk --no-cache add tzdata
 
-RUN mkdir "./pb"
 
-COPY --from=builder /main ./pb/main/main
+COPY --from=builder /main ./main
 
-EXPOSE 8080
-CMD ["/pb/main/main", "serve", "--http=0.0.0.0:8080"]
+EXPOSE 3000
+
+RUN apk add dumb-init
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+CMD ./main

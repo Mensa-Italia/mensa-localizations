@@ -8,7 +8,6 @@ import (
 )
 
 type config struct {
-	TolgeeKey string `env:"TOLGEE_KEY" envDefault:""`
 	// --- mensa-localizations: Redis ---
 	RedisAddr string `env:"REDIS_ADDR" envDefault:"localhost:6379"`
 
