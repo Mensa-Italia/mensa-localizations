@@ -21,6 +21,10 @@ func main() {
 		log.Fatal("TOLGEE_APP_KEY is required")
 	}
 
+	if !fiber.IsChild() {
+		RebuildTheCache()
+	}
+
 	app := fiber.New(fiber.Config{
 		JSONEncoder: json.Marshal,
 		JSONDecoder: json.Unmarshal,
