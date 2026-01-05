@@ -12,7 +12,7 @@ func RebuildTheCache() {
 	appKey := localenv.GetTolgeeAppKey()
 
 	_, bytesOfLanguages, err := GetLanguages(rootCtx, appKey)
-	if err != nil {
+	if err != nil || len(bytesOfLanguages) == 0 {
 		return
 	}
 
@@ -35,6 +35,9 @@ func RebuildTheCache() {
 		return
 	}
 	for name, translations := range langAndTrans {
+		if len(translations) == 0 {
+			continue
+		}
 		_ = redisPut(rootCtx, "tolgee:lang:"+name+":false", translations, 0)
 		if s3c != nil {
 			_ = s3c.putObject(rootCtx, "tolgee:lang:"+name+":false", translations, "application/json", map[string]string{})
@@ -46,6 +49,9 @@ func RebuildTheCache() {
 		return
 	}
 	for name, translations := range langAndTransNested {
+		if len(translations) == 0 {
+			continue
+		}
 		_ = redisPut(rootCtx, "tolgee:lang:"+name+":true", translations, 0)
 		if s3c != nil {
 			_ = s3c.putObject(rootCtx, "tolgee:lang:"+name+":true", translations, "application/json", map[string]string{})

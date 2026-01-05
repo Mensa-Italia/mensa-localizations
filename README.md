@@ -1,168 +1,62 @@
 # mensa-localizations
 
-Microservizio Go (Fiber) che fa da **proxy + cache** per i contenuti Tolgee:
+Microservizio Go (Fiber) che fa da **proxy + cache best-effort** per un singolo progetto Tolgee (chiave da env `TOLGEE_APP_KEY`). All’avvio e su webhook ricarica **lingue** e **traduzioni** (flat e nested) in Redis e, se abilitato, su S3.
 
-- **Lingue** del progetto Tolgee
-- **Export JSON** delle traduzioni (flat o nested)
-
-La cache è **best-effort** e multilevel:
-
-1. **Redis** (primary cache)
-2. **S3/MinIO** (fallback `latest` + storico versionato)
-3. **Tolgee** (fonte dati)
-
-- **NEW**: l’aggiornamento ora è solo **on-demand** via webhook (`/api/:app/update`); non c’è più il refresh periodico ogni 15 minuti.
+## Cosa fa
+- Espone API HTTP su `:3000` per lingue e traduzioni Tolgee.
+- Cache **primaria** in Redis; opzionale **replica** su S3/MinIO (stesse key usate in Redis).
+- Warm-up iniziale (se non processo child Fiber) e su webhook `/api/update` con firma Tolgee (`Tolgee-Signature` + `WEBHOOK_SECRET`).
+- Se un payload non è in cache: per **lingue** prova Tolgee live e ri-salva in cache; per **traduzioni** tenta fallback `en` dal cache (niente fetch live: serve il warm-up/webhook).
 
 ## API
-
 Base URL: `http://localhost:3000`
 
-### `GET /api/:app`
-Ritorna la response Tolgee di:
+- `GET /api/healthz` → plain `ok`.
+- `GET /api/languages` → JSON lingue Tolgee (cache → S3 → Tolgee live → cache).
+- `GET /api/:lang` → traduzioni JSON per `:lang`.
+  - Query `nested=true|false` (default `false` flat).
+  - Cache → S3; se manca e `:lang` ≠ `en`, ritorna `en` dal cache; se manca anche `en`, errore.
+- `ALL /api/update` → webhook Tolgee per rigenerare tutte le cache (lingue + traduzioni flat/nested di ogni lingua).
+  - Richiede header `Tolgee-Signature` JSON `{ "timestamp": <ms>, "signature": "<hmac-sha256>" }` firmato con `WEBHOOK_SECRET` sul payload ricevuto.
+  - Ritorna `200` se accettato, `401` se firma non valida/assenza secret.
+- Catch-all `*` → serve traduzioni `en` dal cache (rispetta `nested=true`).
 
-- `https://app.tolgee.io/v2/projects/languages?ak=:app&size=1000`
-
-Esempio:
-
-```bash
-curl -s "http://localhost:3000/api/<TOLGEE_AK>" | jq .
-```
-
-### `GET /api/:app/:lang`
-Ritorna le traduzioni Tolgee tramite:
-
-- `https://app.tolgee.io/v2/projects/export?ak=:app&languages=:lang&format=JSON&zip=false&size=1000`
-
-Query params:
-- `nested` (boolean, default `false`)
-  - `false`: JSON “flat” (compat)
-  - `true`: JSON “nested”
-
-Esempi:
-
-```bash
-# flat
-curl -s "http://localhost:3000/api/<TOLGEE_AK>/it" | jq .
-
-# nested
-curl -s "http://localhost:3000/api/<TOLGEE_AK>/it?nested=true" | jq .
-```
-
-### `ALL /api/:app/update`
-Endpoint da chiamare via webhook per forzare il refresh di **lingue** e di **tutte le traduzioni** (flat + nested) per ogni lingua.
-
-- Richiede query `?secret=<WEBHOOK_SECRET>` che deve combaciare con la variabile d’ambiente `WEBHOOK_SECRET`.
-- Metodo accettato: qualunque (`GET`/`POST`/etc., lato webhook usare il preferito).
-- Risposta: JSON con riepilogo di lingue trovate e tentativi di refresh.
-
-Esempio:
-
-```bash
-curl -s "http://localhost:3000/api/<TOLGEE_AK>/update?secret=$WEBHOOK_SECRET" | jq .
-```
-
-### `GET /healthz`
-Healthcheck semplice.
-
-```bash
-curl -s "http://localhost:3000/healthz"
-```
-
-## Caching
-
-### Redis
-Chiavi usate:
-- Traduzioni: `translations:<app>:<lang>:<mode>`
-- Lingue: `languages:<app>`
-- Timestamp fetch (unix seconds): `<key>:fetched_utc`
-
-TTL:
-- Valore Redis: `10m` (costante `redisValueTTL` in `main/main.go`)
-
-### S3 / MinIO
-Quando S3 è abilitato, il servizio:
-- legge un **fallback** da `latest.json`
-- quando scarica da Tolgee, salva:
-  - un oggetto **versionato** immutabile
-  - e aggiorna `latest.json`
-
-Percorsi (key) principali:
-
-**Traduzioni**
-- `localizations/<app>/<lang>_<mode>/latest.json`
-- `localizations/<app>/<lang>_<mode>/<ts>_<sha>.json`
-
-**Lingue**
-- `tolgee-languages/<app>/latest.json`
-- `tolgee-languages/<app>/<ts>_<sha>.json`
-
-Metadata S3 (su oggetti scritti dal servizio):
-- `created_utc` in formato `20060102T150405Z` (usato per capire staleness)
-- `sha256`
-- `app`, `lang` (solo per traduzioni)
+## Cache
+- **Redis**: chiavi `tolgee:languages`, `tolgee:lang:<tag>:<nested>` (`nested` è `true|false`). Nessun TTL (persistenza fino a sovrascrittura).
+- **S3/MinIO** (opzionale): usa le stesse chiavi stringa come object key; scrive `Content-Type: application/json`.
 
 ## Variabili d’ambiente
+- Tolgee: `TOLGEE_APP_KEY` (**required**) chiave progetto; `WEBHOOK_SECRET` (**required** per accettare `/api/update`).
+- Redis: `REDIS_ADDR` (default `localhost:6379`), `REDIS_PASSWORD` (default vuota).
+- S3/MinIO: `S3_ENABLED` (default `true`), `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY` (**required se S3_ENABLED=true**), `S3_REGION` (default `us-east-1`), `S3_FORCE_PATH_STYLE` (default `true`).
+- Debug: `DEBUG=true` per loggare il parse delle env.
 
-Il progetto usa `github.com/caarlos0/env` (vedi `tools/env/init.go`).
-
-### Redis
-- `REDIS_ADDR` (default `localhost:6379`)
-- `REDIS_PASSWORD` (default vuota)
-
-### S3 / MinIO
-- `S3_ENABLED` (default `true`)
-- `S3_BUCKET` (**required** se `S3_ENABLED=true`)
-- `S3_REGION` (default `us-east-1`)
-- `S3_ENDPOINT` (**required** se `S3_ENABLED=true`)
-- `S3_ACCESS_KEY` (**required** se `S3_ENABLED=true`)
-- `S3_SECRET_KEY` (**required** se `S3_ENABLED=true`)
-- `S3_FORCE_PATH_STYLE` (default `true`)
-
-### Webhook
-- `WEBHOOK_SECRET` (secret obbligatorio per chiamare `/api/:app/update`)
-
-## Run (locale)
-
-Prerequisiti: Go installato + Redis in esecuzione.
+## Esecuzione locale
+Prerequisiti: Go + Redis in esecuzione (S3 opzionale).
 
 ```bash
 cd mensa-localizations
-
 go run ./main
 ```
 
-Il servizio ascolta su `:3000`.
+Servizio su `http://localhost:3000`.
 
-## Run (Docker)
-
+## Docker
 Build:
-
 ```bash
 docker build -t mensa-localizations:local .
 ```
-
-Run (esempio minimo con Redis esterno e S3 disabilitato):
-
+Run (Redis esterno, S3 disabilitato esempio minimo):
 ```bash
 docker run --rm -p 3000:3000 \
+  -e TOLGEE_APP_KEY=<ak> \
   -e REDIS_ADDR=host.docker.internal:6379 \
   -e S3_ENABLED=false \
   -e WEBHOOK_SECRET=mysecret \
   mensa-localizations:local
 ```
+> Su Linux usare l’IP del gateway Docker al posto di `host.docker.internal`.
 
-> Nota: su Linux al posto di `host.docker.internal` potrebbe servire l’IP del gateway Docker.
-
-## Logging
-
-Il servizio stampa log **molto verbosi** (prefisso `[cache]`) per capire facilmente:
-- hit/miss/error Redis
-- fallback S3 + metadata `created_utc`
-- chiamate Tolgee
-- richieste di refresh webhook e `singleflight`
-
-## Note / gotchas
-
-- L’AK Tolgee viene preso dal path parameter `:app`.
-- In caso di problemi a Redis/S3/Tolgee, la risposta è best-effort e tende a restituire `{}`.
-- Il refresh avviene **solo** quando chiamato l’endpoint `/api/:app/update` con secret valido (niente più refresh periodico).
+## Note
+- Log verbose con prefissi `[cache]`/`[s3]`/`[webhook]` per osservare hit/miss e firma webhook.
+- Se la cache traduzioni non è stata warmata (es. nessun webhook/avvio iniziale fallito), le richieste possono fallire: chiamare `/api/update` con firma valida.
