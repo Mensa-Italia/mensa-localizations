@@ -369,53 +369,63 @@ func getTranslationsCached(ctx context.Context, s3c *s3Client, appID, lang strin
 }
 
 // getLanguagesCached keeps Redis first, then S3 latest, then Tolgee; writes back to Redis and S3 when fetched from Tolgee.
-func getLanguagesCached(ctx context.Context, s3c *s3Client, appID string) ([]byte, error) {
+func getLanguagesCached(ctx context.Context, s3c *s3Client, appID string, force bool) ([]byte, error) {
 	redisKey := "languages:" + appID
 	fetchedAtKey := redisKey + redisFetchedAtSuffix
 	log.Printf("[cache][languages] request app=%q redisKey=%q", appID, redisKey)
 
-	b, err := rdb.Get(ctx, redisKey).Bytes()
-	if err == nil {
-		log.Printf("[cache][redis] HIT key=%q bytes=%d", redisKey, len(b))
-		return b, nil
-	}
-	if err == redis.Nil {
-		log.Printf("[cache][redis] MISS key=%q", redisKey)
-	} else {
-		log.Printf("[cache][redis] ERROR key=%q err=%v (best-effort)", redisKey, err)
-	}
-
-	v, sfErr, _ := sf.Do(redisKey, func() (interface{}, error) {
-		log.Printf("[cache][singleflight] computing key=%q", redisKey)
-		bb, e := rdb.Get(ctx, redisKey).Bytes()
-		if e == nil {
-			log.Printf("[cache][redis] HIT (2nd check) key=%q bytes=%d", redisKey, len(bb))
-			return bb, nil
+	if !force {
+		b, err := rdb.Get(ctx, redisKey).Bytes()
+		if err == nil {
+			log.Printf("[cache][redis] HIT key=%q bytes=%d", redisKey, len(b))
+			return b, nil
 		}
-		if e == redis.Nil {
-			log.Printf("[cache][redis] MISS (2nd check) key=%q", redisKey)
+		if err == redis.Nil {
+			log.Printf("[cache][redis] MISS key=%q", redisKey)
 		} else {
-			log.Printf("[cache][redis] ERROR (2nd check) key=%q err=%v", redisKey, e)
+			log.Printf("[cache][redis] ERROR key=%q err=%v (best-effort)", redisKey, err)
+		}
+	}
+
+	callKey := redisKey
+	if force {
+		callKey = redisKey + ":force"
+	}
+
+	v, sfErr, _ := sf.Do(callKey, func() (interface{}, error) {
+		log.Printf("[cache][singleflight] computing key=%q force=%v", callKey, force)
+
+		if !force {
+			bb, e := rdb.Get(ctx, redisKey).Bytes()
+			if e == nil {
+				log.Printf("[cache][redis] HIT (2nd check) key=%q bytes=%d", redisKey, len(bb))
+				return bb, nil
+			}
+			if e == redis.Nil {
+				log.Printf("[cache][redis] MISS (2nd check) key=%q", redisKey)
+			} else {
+				log.Printf("[cache][redis] ERROR (2nd check) key=%q err=%v", redisKey, e)
+			}
+
+			if s3c != nil {
+				fallback, s3err := s3c.getLatestLanguages(ctx, appID)
+				if s3err == nil && len(fallback) > 0 {
+					_now := time.Now().UTC()
+					log.Printf("[cache][s3] using fallback for languages app=%q -> write redis key=%q ttl=%s", appID, redisKey, redisValueTTL)
+					_ = rdb.Set(ctx, redisKey, fallback, redisValueTTL).Err()
+					_ = rdb.Set(ctx, fetchedAtKey, strconv.FormatInt(_now.Unix(), 10), redisValueTTL).Err()
+
+					return fallback, nil
+				}
+				if s3err != nil {
+					log.Printf("[cache][s3] fallback failed for languages app=%q err=%v", appID, s3err)
+				}
+			} else {
+				log.Printf("[cache][s3] disabled (no client) -> skip languages fallback")
+			}
 		}
 
-		if s3c != nil {
-			fallback, s3err := s3c.getLatestLanguages(ctx, appID)
-			if s3err == nil && len(fallback) > 0 {
-				_now := time.Now().UTC()
-				log.Printf("[cache][s3] using fallback for languages app=%q -> write redis key=%q ttl=%s", appID, redisKey, redisValueTTL)
-				_ = rdb.Set(ctx, redisKey, fallback, redisValueTTL).Err()
-				_ = rdb.Set(ctx, fetchedAtKey, strconv.FormatInt(_now.Unix(), 10), redisValueTTL).Err()
-
-				return fallback, nil
-			}
-			if s3err != nil {
-				log.Printf("[cache][s3] fallback failed for languages app=%q err=%v", appID, s3err)
-			}
-		} else {
-			log.Printf("[cache][s3] disabled (no client) -> skip languages fallback")
-		}
-
-		// Tolgee
+		// Tolgee fetch (force or cache miss)
 		tolgeeAK := appID
 		if tolgeeAK == "" {
 			log.Printf("[cache][tolgee] SKIP languages: empty ak (appID)")
@@ -423,7 +433,7 @@ func getLanguagesCached(ctx context.Context, s3c *s3Client, appID string) ([]byt
 		}
 
 		url := "https://app.tolgee.io/v2/projects/languages"
-		log.Printf("[cache][tolgee] GET languages url=%q ak=%q", url, tolgeeAK)
+		log.Printf("[cache][tolgee] GET languages url=%q ak=%q force=%v", url, tolgeeAK, force)
 
 		client := resty.New().
 			SetTimeout(0).
@@ -629,12 +639,12 @@ func verifyTolgeeSignature(secret string, rawHeader string, body []byte) bool {
 	return true
 }
 
-func refreshAppTranslations(ctx context.Context, s3c *s3Client, appID string) updateSummary {
+func refreshAppTranslations(ctx context.Context, s3c *s3Client, appID string, force bool) updateSummary {
 	log.Printf("[update] starting refresh for app=%q", appID)
 	started := time.Now().UTC()
 	summary := updateSummary{App: appID, StartedAt: started.Format(time.RFC3339)}
 
-	langsPayload, err := getLanguagesCached(ctx, s3c, appID)
+	langsPayload, err := getLanguagesCached(ctx, s3c, appID, force)
 	if err != nil {
 		summary.Failures = append(summary.Failures, "languages fetch failed: "+err.Error())
 		summary.FinishedAt = time.Now().UTC().Format(time.RFC3339)
@@ -692,7 +702,7 @@ func main() {
 
 	// Initial warmup: languages + all translations (flat + nested)
 	log.Printf("[startup] warmup: fetching languages and translations for app=%s", appKey)
-	_ = refreshAppTranslations(rootCtx, s3c, appKey)
+	_ = refreshAppTranslations(rootCtx, s3c, appKey, true)
 	log.Printf("[startup] warmup done")
 
 	app := fiber.New(fiber.Config{
@@ -738,14 +748,14 @@ func makeUpdateHandler(appKey string, s3c *s3Client) fiber.Handler {
 			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "invalid webhook signature"})
 		}
 		log.Printf("[webhook] accepted -> refresh app=%s", appKey)
-		summary := refreshAppTranslations(c.Context(), s3c, appKey)
+		summary := refreshAppTranslations(c.Context(), s3c, appKey, true)
 		return c.Status(http.StatusOK).JSON(summary)
 	}
 }
 
 func makeLanguagesHandler(appKey string, s3c *s3Client) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		data, err := getLanguagesCached(c.Context(), s3c, appKey)
+		data, err := getLanguagesCached(c.Context(), s3c, appKey, false)
 		if err != nil {
 			log.Printf("[api][languages] error: %v", err)
 		}
@@ -768,7 +778,7 @@ func makeTranslationsHandler(appKey string, s3c *s3Client) fiber.Handler {
 			}
 		}
 
-		langsPayload, _ := getLanguagesCached(c.Context(), s3c, appKey)
+		langsPayload, _ := getLanguagesCached(c.Context(), s3c, appKey, false)
 		available := availableLanguagesFromPayload(langsPayload)
 		preferred := parseAcceptLanguageHeader(c.Get("Accept-Language"))
 
@@ -805,7 +815,7 @@ func makeTranslationsHandler(appKey string, s3c *s3Client) fiber.Handler {
 
 func makeFallbackHandler(appKey string, s3c *s3Client) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		langsPayload, _ := getLanguagesCached(c.Context(), s3c, appKey)
+		langsPayload, _ := getLanguagesCached(c.Context(), s3c, appKey, false)
 		available := availableLanguagesFromPayload(langsPayload)
 		preferred := parseAcceptLanguageHeader(c.Get("Accept-Language"))
 
