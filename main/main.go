@@ -32,8 +32,9 @@ import (
 
 var (
 	rdb = redis.NewClient(&redis.Options{
-		Addr: localenv.GetRedisAddr(),
-		DB:   0,
+		Addr:     localenv.GetRedisAddr(),
+		Password: localenv.GetRedisPassword(),
+		DB:       0,
 	})
 
 	sf singleflight.Group

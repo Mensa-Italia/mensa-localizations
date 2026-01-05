@@ -9,7 +9,8 @@ import (
 
 type config struct {
 	// --- mensa-localizations: Redis ---
-	RedisAddr string `env:"REDIS_ADDR" envDefault:"localhost:6379"`
+	RedisAddr     string `env:"REDIS_ADDR" envDefault:"localhost:6379"`
+	RedisPassword string `env:"REDIS_PASSWORD" envDefault:""`
 
 	// --- mensa-localizations: MinIO/S3 fallback & versioning ---
 	S3Enabled        bool   `env:"S3_ENABLED" envDefault:"true"`
@@ -33,7 +34,8 @@ func init() {
 }
 
 // --- Nuovi getter usati da mensa-localizations/main.go ---
-func GetRedisAddr() string { return cfg.RedisAddr }
+func GetRedisAddr() string     { return cfg.RedisAddr }
+func GetRedisPassword() string { return cfg.RedisPassword }
 
 func GetS3Enabled() bool { return cfg.S3Enabled }
 func GetS3Bucket() string {
