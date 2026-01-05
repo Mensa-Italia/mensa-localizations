@@ -340,5 +340,9 @@ func main() {
 		return c.Status(200).Send(data)
 	})
 
+	app.Get("/healthz", func(c *fiber.Ctx) error {
+		return c.Status(200).SendString("ok")
+	})
+
 	log.Fatal(app.Listen(":3000"))
 }
