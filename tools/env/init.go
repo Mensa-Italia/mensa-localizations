@@ -20,6 +20,13 @@ type config struct {
 	S3AccessKey      string `env:"S3_ACCESS_KEY" envDefault:""`
 	S3SecretKey      string `env:"S3_SECRET_KEY" envDefault:""`
 	S3ForcePathStyle bool   `env:"S3_FORCE_PATH_STYLE" envDefault:"true"`
+
+	// --- webhook secret ---
+	WebhookSecret string `env:"WEBHOOK_SECRET" envDefault:""`
+
+	// --- app id/secret mappings (comma separated: id:appID) ---
+	AppIDsMapping     string `env:"APP_IDS_MAPPING" envDefault:""`
+	AppSecretsMapping string `env:"APP_SECRETS_MAPPING" envDefault:""`
 }
 
 var cfg = config{}
@@ -56,3 +63,6 @@ func GetS3SecretKey() string {
 func GetS3ForcePathStyle() bool {
 	return cfg.S3ForcePathStyle
 }
+func GetWebhookSecret() string        { return cfg.WebhookSecret }
+func GetAppIDsMappingRaw() string     { return cfg.AppIDsMapping }
+func GetAppSecretsMappingRaw() string { return cfg.AppSecretsMapping }

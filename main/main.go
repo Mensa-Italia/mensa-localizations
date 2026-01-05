@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -231,10 +232,10 @@ func (s *s3Client) putLanguagesVersionAndLatest(ctx context.Context, appID strin
 
 const (
 	redisFetchedAtSuffix = ":fetched_utc" // unix seconds
-	staleAfter           = 15 * time.Minute
 	redisValueTTL        = 10 * time.Minute
 )
 
+// parseUnixSeconds is still used for backward compatibility logs; kept minimal.
 func parseUnixSeconds(s string) (time.Time, bool) {
 	if s == "" {
 		return time.Time{}, false
@@ -246,57 +247,13 @@ func parseUnixSeconds(s string) (time.Time, bool) {
 	return time.Unix(i, 0).UTC(), true
 }
 
-func (s *s3Client) headCreatedUTC(ctx context.Context, key string) (time.Time, bool) {
-	log.Printf("[cache][s3] HEAD key=%q bucket=%q (read created_utc)", key, s.bucket)
-	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		log.Printf("[cache][s3] HEAD failed key=%q err=%v", key, err)
-		return time.Time{}, false
-	}
-	if out.Metadata == nil {
-		log.Printf("[cache][s3] HEAD ok but no metadata key=%q", key)
-		return time.Time{}, false
-	}
-	raw := out.Metadata["created_utc"]
-	if raw == "" {
-		log.Printf("[cache][s3] HEAD ok but created_utc missing key=%q", key)
-		return time.Time{}, false
-	}
-	t, err := time.Parse("20060102T150405Z", raw)
-	if err != nil {
-		log.Printf("[cache][s3] HEAD created_utc parse error key=%q raw=%q err=%v", key, raw, err)
-		return time.Time{}, false
-	}
-	log.Printf("[cache][s3] HEAD created_utc key=%q created_utc=%s", key, t.UTC().Format(time.RFC3339))
-	return t.UTC(), true
-}
-
-func shouldRefresh(now, fetchedAt time.Time) bool {
-	if fetchedAt.IsZero() {
-		return false
-	}
-	return now.Sub(fetchedAt) > staleAfter
-}
-
-func scheduleRefreshBestEffort(refreshKey string, fn func()) {
-	log.Printf("[cache][refresh] schedule refreshKey=%q", refreshKey)
-	_, _, _ = sf.Do("refresh:"+refreshKey, func() (interface{}, error) {
-		log.Printf("[cache][refresh] running in background refreshKey=%q", refreshKey)
-		go fn()
-		return struct{}{}, nil
-	})
-}
-
 // getTranslationsCached:
 // 1) prova Redis (best-effort)
 // 2) se Redis non disponibile o miss: prova S3 latest (best-effort)
 // 3) se S3 non disponibile o miss: prova Tolgee (timeout 10s)
 // 4) se Tolgee va ok: salva Redis + crea nuova versione su S3 + aggiorna latest (best-effort)
 // 5) se tutto fallisce: ritorna JSON vuoto
-func getTranslationsCached(ctx context.Context, s3c *s3Client, appID, lang string, nested bool) ([]byte, error) {
+func getTranslationsCached(ctx context.Context, s3c *s3Client, appID, lang string, nested bool, force bool) ([]byte, error) {
 	mode := "flat"
 	if nested {
 		mode = "nested"
@@ -308,72 +265,49 @@ func getTranslationsCached(ctx context.Context, s3c *s3Client, appID, lang strin
 
 	log.Printf("[cache][translations] request app=%q lang=%q mode=%q redisKey=%q", appID, lang, mode, redisKey)
 
-	b, err := rdb.Get(ctx, redisKey).Bytes()
-	if err == nil {
-		log.Printf("[cache][redis] HIT key=%q bytes=%d", redisKey, len(b))
-		if tsRaw, e2 := rdb.Get(ctx, fetchedAtKey).Result(); e2 == nil {
-			if t, ok := parseUnixSeconds(tsRaw); ok {
-				age := time.Since(t)
-				log.Printf("[cache][redis] fetchedAt key=%q ts=%s age=%s", fetchedAtKey, t.Format(time.RFC3339), age)
-				if shouldRefresh(time.Now().UTC(), t) {
-					log.Printf("[cache][redis] STALE -> schedule refresh key=%q age=%s", redisKey, age)
-					scheduleRefreshBestEffort(redisKey, func() {
-						_, _ = getTranslationsCached(context.Background(), s3c, appID, lang, nested)
-					})
-				}
-			} else {
-				log.Printf("[cache][redis] fetchedAt parse failed key=%q raw=%q", fetchedAtKey, tsRaw)
-			}
-		} else {
-			log.Printf("[cache][redis] fetchedAt missing/unavailable key=%q err=%v", fetchedAtKey, e2)
+	if !force {
+		b, err := rdb.Get(ctx, redisKey).Bytes()
+		if err == nil {
+			log.Printf("[cache][redis] HIT key=%q bytes=%d", redisKey, len(b))
+			return b, nil
 		}
-		return b, nil
-	}
-	if err == redis.Nil {
-		log.Printf("[cache][redis] MISS key=%q", redisKey)
-	} else {
-		log.Printf("[cache][redis] ERROR key=%q err=%v (best-effort)", redisKey, err)
+		if err == redis.Nil {
+			log.Printf("[cache][redis] MISS key=%q", redisKey)
+		} else {
+			log.Printf("[cache][redis] ERROR key=%q err=%v (best-effort)", redisKey, err)
+		}
 	}
 
 	v, sfErr, _ := sf.Do(redisKey, func() (interface{}, error) {
 		log.Printf("[cache][singleflight] computing key=%q", redisKey)
-		bb, e := rdb.Get(ctx, redisKey).Bytes()
-		if e == nil {
-			log.Printf("[cache][redis] HIT (2nd check) key=%q bytes=%d", redisKey, len(bb))
-			return bb, nil
-		}
-		if e == redis.Nil {
-			log.Printf("[cache][redis] MISS (2nd check) key=%q", redisKey)
-		} else {
-			log.Printf("[cache][redis] ERROR (2nd check) key=%q err=%v", redisKey, e)
-		}
+		if !force {
+			bb, e := rdb.Get(ctx, redisKey).Bytes()
+			if e == nil {
+				log.Printf("[cache][redis] HIT (2nd check) key=%q bytes=%d", redisKey, len(bb))
+				return bb, nil
+			}
+			if e == redis.Nil {
+				log.Printf("[cache][redis] MISS (2nd check) key=%q", redisKey)
+			} else {
+				log.Printf("[cache][redis] ERROR (2nd check) key=%q err=%v", redisKey, e)
+			}
 
-		if s3c != nil {
-			fallback, s3err := s3c.getLatest(ctx, appID, lang+"_"+mode)
-			if s3err == nil && len(fallback) > 0 {
-				_now := time.Now().UTC()
-				log.Printf("[cache][s3] using fallback for translations app=%q lang=%q mode=%q -> write redis key=%q ttl=%s", appID, lang, mode, redisKey, redisValueTTL)
-				_ = rdb.Set(ctx, redisKey, fallback, redisValueTTL).Err()
-				_ = rdb.Set(ctx, fetchedAtKey, strconv.FormatInt(_now.Unix(), 10), redisValueTTL).Err()
+			if s3c != nil {
+				fallback, s3err := s3c.getLatest(ctx, appID, lang+"_"+mode)
+				if s3err == nil && len(fallback) > 0 {
+					_now := time.Now().UTC()
+					log.Printf("[cache][s3] using fallback for translations app=%q lang=%q mode=%q -> write redis key=%q ttl=%s", appID, lang, mode, redisKey, redisValueTTL)
+					_ = rdb.Set(ctx, redisKey, fallback, redisValueTTL).Err()
+					_ = rdb.Set(ctx, fetchedAtKey, strconv.FormatInt(_now.Unix(), 10), redisValueTTL).Err()
 
-				if createdAt, ok := s3c.headCreatedUTC(ctx, s3LatestKey(appID, lang+"_"+mode)); ok {
-					age := _now.Sub(createdAt)
-					log.Printf("[cache][s3] latest created_utc=%s age=%s key=%q", createdAt.Format(time.RFC3339), age, s3LatestKey(appID, lang+"_"+mode))
-					if shouldRefresh(_now, createdAt) {
-						log.Printf("[cache][s3] STALE -> schedule refresh key=%q age=%s", redisKey, age)
-						scheduleRefreshBestEffort(redisKey, func() {
-							_, _ = getTranslationsCached(context.Background(), s3c, appID, lang, nested)
-						})
-					}
+					return fallback, nil
 				}
-
-				return fallback, nil
+				if s3err != nil {
+					log.Printf("[cache][s3] fallback failed for translations app=%q lang=%q mode=%q err=%v", appID, lang, mode, s3err)
+				}
+			} else {
+				log.Printf("[cache][s3] disabled (no client) -> skip translations fallback")
 			}
-			if s3err != nil {
-				log.Printf("[cache][s3] fallback failed for translations app=%q lang=%q mode=%q err=%v", appID, lang, mode, s3err)
-			}
-		} else {
-			log.Printf("[cache][s3] disabled (no client) -> skip translations fallback")
 		}
 
 		// Ultima risorsa: Tolgee (timeout 10s)
@@ -464,22 +398,6 @@ func getLanguagesCached(ctx context.Context, s3c *s3Client, appID string) ([]byt
 	b, err := rdb.Get(ctx, redisKey).Bytes()
 	if err == nil {
 		log.Printf("[cache][redis] HIT key=%q bytes=%d", redisKey, len(b))
-		if tsRaw, e2 := rdb.Get(ctx, fetchedAtKey).Result(); e2 == nil {
-			if t, ok := parseUnixSeconds(tsRaw); ok {
-				age := time.Since(t)
-				log.Printf("[cache][redis] fetchedAt key=%q ts=%s age=%s", fetchedAtKey, t.Format(time.RFC3339), age)
-				if shouldRefresh(time.Now().UTC(), t) {
-					log.Printf("[cache][redis] STALE -> schedule languages refresh key=%q age=%s", redisKey, age)
-					scheduleRefreshBestEffort(redisKey, func() {
-						_, _ = getLanguagesCached(context.Background(), s3c, appID)
-					})
-				}
-			} else {
-				log.Printf("[cache][redis] fetchedAt parse failed key=%q raw=%q", fetchedAtKey, tsRaw)
-			}
-		} else {
-			log.Printf("[cache][redis] fetchedAt missing/unavailable key=%q err=%v", fetchedAtKey, e2)
-		}
 		return b, nil
 	}
 	if err == redis.Nil {
@@ -508,17 +426,6 @@ func getLanguagesCached(ctx context.Context, s3c *s3Client, appID string) ([]byt
 				log.Printf("[cache][s3] using fallback for languages app=%q -> write redis key=%q ttl=%s", appID, redisKey, redisValueTTL)
 				_ = rdb.Set(ctx, redisKey, fallback, redisValueTTL).Err()
 				_ = rdb.Set(ctx, fetchedAtKey, strconv.FormatInt(_now.Unix(), 10), redisValueTTL).Err()
-
-				if createdAt, ok := s3c.headCreatedUTC(ctx, s3LanguagesLatestKey(appID)); ok {
-					age := _now.Sub(createdAt)
-					log.Printf("[cache][s3] languages latest created_utc=%s age=%s key=%q", createdAt.Format(time.RFC3339), age, s3LanguagesLatestKey(appID))
-					if shouldRefresh(_now, createdAt) {
-						log.Printf("[cache][s3] STALE -> schedule languages refresh key=%q age=%s", redisKey, age)
-						scheduleRefreshBestEffort(redisKey, func() {
-							_, _ = getLanguagesCached(context.Background(), s3c, appID)
-						})
-					}
-				}
 
 				return fallback, nil
 			}
@@ -594,6 +501,142 @@ func getLanguagesCached(ctx context.Context, s3c *s3Client, appID string) ([]byt
 	return bb, nil
 }
 
+type tolgeeLanguage struct {
+	Tag string `json:"tag"`
+}
+
+type updateSummary struct {
+	App        string   `json:"app"`
+	Languages  []string `json:"languages"`
+	Refreshed  int      `json:"refreshed"`
+	Failures   []string `json:"failures,omitempty"`
+	StartedAt  string   `json:"started_at"`
+	FinishedAt string   `json:"finished_at"`
+}
+
+type tolgeeSignatureHeader struct {
+	Timestamp int64  `json:"timestamp"`
+	Signature string `json:"signature"`
+}
+
+type idMappings struct {
+	appIDs    map[string]string
+	appSecret map[string]string
+}
+
+func parseMappings(raw string) map[string]string {
+	m := make(map[string]string)
+	if raw == "" {
+		return m
+	}
+	parts := strings.Split(raw, ",")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		kv := strings.SplitN(p, ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(kv[0])
+		val := strings.TrimSpace(kv[1])
+		if key != "" && val != "" {
+			m[key] = val
+		}
+	}
+	return m
+}
+
+func loadIDMappings() idMappings {
+	return idMappings{
+		appIDs:    parseMappings(localenv.GetAppIDsMappingRaw()),
+		appSecret: parseMappings(localenv.GetAppSecretsMappingRaw()),
+	}
+}
+
+func resolveAppID(idOrApp string, maps idMappings) (string, bool) {
+	if val, ok := maps.appIDs[idOrApp]; ok {
+		return val, true
+	}
+	return idOrApp, false
+}
+
+func resolveSecret(idOrApp string, maps idMappings) string {
+	if val, ok := maps.appSecret[idOrApp]; ok {
+		return val
+	}
+	return localenv.GetWebhookSecret()
+}
+
+func verifyTolgeeSignature(secret string, rawHeader string, body []byte) bool {
+	if secret == "" || rawHeader == "" {
+		return false
+	}
+	var hdr tolgeeSignatureHeader
+	if err := json.Unmarshal([]byte(rawHeader), &hdr); err != nil {
+		log.Printf("[webhook] signature header unmarshal error: %v", err)
+		return false
+	}
+	if hdr.Timestamp <= 0 || hdr.Signature == "" {
+		return false
+	}
+
+	signedPayload := fmt.Sprintf("%d.%s", hdr.Timestamp, string(body))
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signedPayload))
+	expected := hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(expected), []byte(hdr.Signature)) {
+		log.Printf("[webhook] signature mismatch")
+		return false
+	}
+
+	// timestamp in ms, reject older than 5 minutes
+	if hdr.Timestamp < time.Now().Add(-5*time.Minute).UnixMilli() {
+		log.Printf("[webhook] signature too old ts=%d", hdr.Timestamp)
+		return false
+	}
+	return true
+}
+
+func refreshAppTranslations(ctx context.Context, s3c *s3Client, appID string) updateSummary {
+	started := time.Now().UTC()
+	summary := updateSummary{App: appID, StartedAt: started.Format(time.RFC3339)}
+
+	langsPayload, err := getLanguagesCached(ctx, s3c, appID)
+	if err != nil {
+		summary.Failures = append(summary.Failures, "languages fetch failed: "+err.Error())
+		summary.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		return summary
+	}
+
+	var langs []tolgeeLanguage
+	if e := json.Unmarshal(langsPayload, &langs); e != nil {
+		summary.Failures = append(summary.Failures, "languages decode failed: "+e.Error())
+		summary.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+		return summary
+	}
+	for _, l := range langs {
+		if strings.TrimSpace(l.Tag) == "" {
+			continue
+		}
+		summary.Languages = append(summary.Languages, l.Tag)
+		if _, e := getTranslationsCached(ctx, s3c, appID, l.Tag, false, true); e != nil {
+			summary.Failures = append(summary.Failures, fmt.Sprintf("%s flat: %v", l.Tag, e))
+		} else {
+			summary.Refreshed++
+		}
+		if _, e := getTranslationsCached(ctx, s3c, appID, l.Tag, true, true); e != nil {
+			summary.Failures = append(summary.Failures, fmt.Sprintf("%s nested: %v", l.Tag, e))
+		} else {
+			summary.Refreshed++
+		}
+	}
+
+	summary.FinishedAt = time.Now().UTC().Format(time.RFC3339)
+	return summary
+}
+
 func main() {
 	rootCtx := context.Background()
 	var s3c *s3Client
@@ -608,6 +651,8 @@ func main() {
 	} else {
 		log.Printf("[cache][s3] disabled via env S3_ENABLED=false")
 	}
+
+	mappings := loadIDMappings()
 
 	app := fiber.New(fiber.Config{
 		JSONEncoder: json.Marshal,
@@ -624,7 +669,8 @@ func main() {
 	})
 
 	app.Get("/api/:app", func(c *fiber.Ctx) error {
-		appID := c.Params("app")
+		appParam := c.Params("app")
+		appID, _ := resolveAppID(appParam, mappings)
 
 		data, err := getLanguagesCached(c.Context(), s3c, appID)
 		if err != nil {
@@ -635,7 +681,8 @@ func main() {
 		return c.Status(200).Send(data)
 	})
 	app.Get("/api/:app/:lang", func(c *fiber.Ctx) error {
-		appID := c.Params("app")
+		appParam := c.Params("app")
+		appID, _ := resolveAppID(appParam, mappings)
 		lang := c.Params("lang")
 
 		nested := false
@@ -646,7 +693,7 @@ func main() {
 			}
 		}
 
-		data, err := getTranslationsCached(c.Context(), s3c, appID, lang, nested)
+		data, err := getTranslationsCached(c.Context(), s3c, appID, lang, nested, false)
 		if err != nil {
 			data = []byte("{}")
 		}
@@ -657,6 +704,23 @@ func main() {
 
 	app.Get("/healthz", func(c *fiber.Ctx) error {
 		return c.Status(200).SendString("ok")
+	})
+
+	app.All("/api/:app/update", func(c *fiber.Ctx) error {
+		appParam := c.Params("app")
+		appID, mapped := resolveAppID(appParam, mappings)
+		if !mapped {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "updates allowed only for numeric mapped ids"})
+		}
+		secret := resolveSecret(appParam, mappings)
+		header := c.Get("Tolgee-Signature")
+		body := c.Body()
+		if !verifyTolgeeSignature(secret, header, body) {
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "invalid webhook signature"})
+		}
+
+		summary := refreshAppTranslations(c.Context(), s3c, appID)
+		return c.Status(http.StatusOK).JSON(summary)
 	})
 
 	log.Fatal(app.Listen(":3000"))

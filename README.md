@@ -11,7 +11,7 @@ La cache è **best-effort** e multilevel:
 2. **S3/MinIO** (fallback `latest` + storico versionato)
 3. **Tolgee** (fonte dati)
 
-In più, se la cache letta (da Redis o S3) risulta “vecchia” (> 15 minuti), viene schedulato un **refresh asincrono** che prova a scaricare una versione nuova da Tolgee e aggiornare tutte le cache, senza bloccare la risposta.
+- **NEW**: l’aggiornamento ora è solo **on-demand** via webhook (`/api/:app/update`); non c’è più il refresh periodico ogni 15 minuti.
 
 ## API
 
@@ -46,6 +46,19 @@ curl -s "http://localhost:3000/api/<TOLGEE_AK>/it" | jq .
 
 # nested
 curl -s "http://localhost:3000/api/<TOLGEE_AK>/it?nested=true" | jq .
+```
+
+### `ALL /api/:app/update`
+Endpoint da chiamare via webhook per forzare il refresh di **lingue** e di **tutte le traduzioni** (flat + nested) per ogni lingua.
+
+- Richiede query `?secret=<WEBHOOK_SECRET>` che deve combaciare con la variabile d’ambiente `WEBHOOK_SECRET`.
+- Metodo accettato: qualunque (`GET`/`POST`/etc., lato webhook usare il preferito).
+- Risposta: JSON con riepilogo di lingue trovate e tentativi di refresh.
+
+Esempio:
+
+```bash
+curl -s "http://localhost:3000/api/<TOLGEE_AK>/update?secret=$WEBHOOK_SECRET" | jq .
 ```
 
 ### `GET /healthz`
@@ -105,6 +118,9 @@ Il progetto usa `github.com/caarlos0/env` (vedi `tools/env/init.go`).
 - `S3_SECRET_KEY` (**required** se `S3_ENABLED=true`)
 - `S3_FORCE_PATH_STYLE` (default `true`)
 
+### Webhook
+- `WEBHOOK_SECRET` (secret obbligatorio per chiamare `/api/:app/update`)
+
 ## Run (locale)
 
 Prerequisiti: Go installato + Redis in esecuzione.
@@ -131,6 +147,7 @@ Run (esempio minimo con Redis esterno e S3 disabilitato):
 docker run --rm -p 3000:3000 \
   -e REDIS_ADDR=host.docker.internal:6379 \
   -e S3_ENABLED=false \
+  -e WEBHOOK_SECRET=mysecret \
   mensa-localizations:local
 ```
 
@@ -142,11 +159,10 @@ Il servizio stampa log **molto verbosi** (prefisso `[cache]`) per capire facilme
 - hit/miss/error Redis
 - fallback S3 + metadata `created_utc`
 - chiamate Tolgee
-- refresh asincroni e `singleflight`
+- richieste di refresh webhook e `singleflight`
 
 ## Note / gotchas
 
 - L’AK Tolgee viene preso dal path parameter `:app`.
 - In caso di problemi a Redis/S3/Tolgee, la risposta è best-effort e tende a restituire `{}`.
-- Il refresh asincrono non blocca la risposta ed è deduplicato con `singleflight`.
-
+- Il refresh avviene **solo** quando chiamato l’endpoint `/api/:app/update` con secret valido (niente più refresh periodico).
