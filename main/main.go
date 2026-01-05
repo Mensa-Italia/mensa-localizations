@@ -600,6 +600,7 @@ func verifyTolgeeSignature(secret string, rawHeader string, body []byte) bool {
 }
 
 func refreshAppTranslations(ctx context.Context, s3c *s3Client, appID string) updateSummary {
+	log.Printf("[update] starting refresh for app=%q", appID)
 	started := time.Now().UTC()
 	summary := updateSummary{App: appID, StartedAt: started.Format(time.RFC3339)}
 
@@ -668,6 +669,27 @@ func main() {
 		return err
 	})
 
+	app.Get("/healthz", func(c *fiber.Ctx) error {
+		return c.Status(200).SendString("ok")
+	})
+
+	app.All("/api/:app/update", func(c *fiber.Ctx) error {
+		appParam := c.Params("app")
+		appID, mapped := resolveAppID(appParam, mappings)
+		if !mapped {
+			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "updates allowed only for numeric mapped ids"})
+		}
+		secret := resolveSecret(appParam, mappings)
+		header := c.Get("Tolgee-Signature")
+		body := c.Body()
+		if !verifyTolgeeSignature(secret, header, body) {
+			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "invalid webhook signature"})
+		}
+
+		summary := refreshAppTranslations(c.Context(), s3c, appID)
+		return c.Status(http.StatusOK).JSON(summary)
+	})
+
 	app.Get("/api/:app", func(c *fiber.Ctx) error {
 		appParam := c.Params("app")
 		appID, _ := resolveAppID(appParam, mappings)
@@ -700,27 +722,6 @@ func main() {
 
 		c.Set("Content-type", "application/json; charset=utf-8")
 		return c.Status(200).Send(data)
-	})
-
-	app.Get("/healthz", func(c *fiber.Ctx) error {
-		return c.Status(200).SendString("ok")
-	})
-
-	app.All("/api/:app/update", func(c *fiber.Ctx) error {
-		appParam := c.Params("app")
-		appID, mapped := resolveAppID(appParam, mappings)
-		if !mapped {
-			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "updates allowed only for numeric mapped ids"})
-		}
-		secret := resolveSecret(appParam, mappings)
-		header := c.Get("Tolgee-Signature")
-		body := c.Body()
-		if !verifyTolgeeSignature(secret, header, body) {
-			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "invalid webhook signature"})
-		}
-
-		summary := refreshAppTranslations(c.Context(), s3c, appID)
-		return c.Status(http.StatusOK).JSON(summary)
 	})
 
 	log.Fatal(app.Listen(":3000"))
