@@ -319,6 +319,14 @@ func main() {
 		Prefork:     true,
 	})
 
+	app.Use(func(c *fiber.Ctx) error {
+		start := time.Now()
+		err := c.Next()
+		duration := time.Since(start)
+		c.Append("Server-Timing", "app;dur="+duration.String())
+		return err
+	})
+
 	app.Get("/api/:app/:lang", func(c *fiber.Ctx) error {
 		appID := c.Params("app")
 		lang := c.Params("lang")
