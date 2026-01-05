@@ -80,8 +80,9 @@ func makeLanguagesHandler() fiber.Handler {
 
 func makeTranslationsHandler() fiber.Handler {
 	return func(c *fiber.Ctx) error {
+		nested := c.Query("nested") == "true"
 		lang := c.Params("lang")
-		cache, err := GetTranslationsFromCache(context.Background(), lang)
+		cache, err := GetTranslationsFromCache(context.Background(), lang, nested)
 		if err != nil {
 			return err
 		}
@@ -92,7 +93,8 @@ func makeTranslationsHandler() fiber.Handler {
 
 func makeFallbackHandler() fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		cache, err := GetTranslationsFromCache(context.Background(), "en")
+		nested := c.Query("nested") == "true"
+		cache, err := GetTranslationsFromCache(context.Background(), "en", nested)
 		if err != nil {
 			return err
 		}

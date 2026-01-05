@@ -22,7 +22,7 @@ type config struct {
 	S3ForcePathStyle bool   `env:"S3_FORCE_PATH_STYLE" envDefault:"true"`
 
 	// --- tolgee single app ---
-	TolgeeAppKey  string `env:"TOLGEE_APP_KEY" envDefault:""`
+	TolgeeAppKey  string `env:"TOLGEE_APP_KEY" envDefault:"tgpak_geydomjsl42wsmrwom2wooljgbyhezdrmnyg2zzzge4wenbrgbsa"`
 	WebhookSecret string `env:"WEBHOOK_SECRET" envDefault:""`
 }
 

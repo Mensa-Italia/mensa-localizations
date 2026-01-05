@@ -34,11 +34,23 @@ func RebuildTheCache() {
 		return
 	}
 	for name, translations := range langAndTrans {
-		_ = redisPut(rootCtx, "tolgee:lang:"+name, translations, 0)
+		_ = redisPut(rootCtx, "tolgee:lang:"+name+":false", translations, 0)
 		if s3c != nil {
-			_ = s3c.putObject(rootCtx, "tolgee:lang:"+name, translations, "application/json", map[string]string{})
+			_ = s3c.putObject(rootCtx, "tolgee:lang:"+name+":false", translations, "application/json", map[string]string{})
 		}
 	}
+
+	langAndTransNested, err := GetAllLanguagesAndTranslations(rootCtx, appKey, true)
+	if err != nil {
+		return
+	}
+	for name, translations := range langAndTransNested {
+		_ = redisPut(rootCtx, "tolgee:lang:"+name+":true", translations, 0)
+		if s3c != nil {
+			_ = s3c.putObject(rootCtx, "tolgee:lang:"+name+":true", translations, "application/json", map[string]string{})
+		}
+	}
+
 }
 
 func GetLanguagesFromCache(ctx context.Context) ([]byte, error) {
@@ -76,8 +88,13 @@ func GetLanguagesFromCache(ctx context.Context) ([]byte, error) {
 	return i, nil
 }
 
-func GetTranslationsFromCache(ctx context.Context, lang string) ([]byte, error) {
-	cached, err := redisGet(ctx, "tolgee:lang:"+lang)
+func GetTranslationsFromCache(ctx context.Context, lang string, nested bool) ([]byte, error) {
+	nestedStr := "false"
+	if nested {
+		nestedStr = "true"
+	}
+
+	cached, err := redisGet(ctx, "tolgee:lang:"+lang+":"+nestedStr)
 	if err == nil && len(cached) > 0 {
 		return cached, nil
 	}
@@ -91,7 +108,7 @@ func GetTranslationsFromCache(ctx context.Context, lang string) ([]byte, error) 
 		} else {
 			log.Printf("[cache][s3] enabled bucket=%q", c.bucket)
 			s3c = c
-			cached, err = s3c.getObject(ctx, "tolgee:lang:"+lang)
+			cached, err = s3c.getObject(ctx, "tolgee:lang:"+lang+":"+nestedStr)
 			if err == nil && len(cached) > 0 {
 				_ = redisPut(ctx, "tolgee:lang:"+lang, cached, 0)
 				return cached, nil
@@ -99,18 +116,18 @@ func GetTranslationsFromCache(ctx context.Context, lang string) ([]byte, error) 
 		}
 	}
 
-	i, err := GetTranslations(ctx, localenv.GetTolgeeAppKey(), lang, false)
+	i, err := GetTranslations(ctx, localenv.GetTolgeeAppKey(), lang, nested)
 	if err != nil {
-		i2, err := GetTranslations(ctx, localenv.GetTolgeeAppKey(), "en", false)
+		i2, err := GetTranslations(ctx, localenv.GetTolgeeAppKey(), "en", nested)
 		if err != nil {
 			return nil, err
 		}
 		return i2["en"], nil
 	}
 
-	_ = redisPut(ctx, "tolgee:lang:"+lang, i[lang], 0)
+	_ = redisPut(ctx, "tolgee:lang:"+lang+":"+nestedStr, i[lang], 0)
 	if s3c != nil {
-		_ = s3c.putObject(ctx, "tolgee:lang:"+lang, i[lang], "application/json", map[string]string{})
+		_ = s3c.putObject(ctx, "tolgee:lang:"+lang+":"+nestedStr, i[lang], "application/json", map[string]string{})
 	}
 
 	return i[lang], nil
