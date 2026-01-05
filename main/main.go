@@ -40,6 +40,7 @@ var (
 	sf singleflight.Group
 )
 
+// S3 client wrapper
 type s3Client struct {
 	client *s3.Client
 	bucket string
@@ -235,24 +236,7 @@ const (
 	redisValueTTL        = 10 * time.Minute
 )
 
-// parseUnixSeconds is still used for backward compatibility logs; kept minimal.
-func parseUnixSeconds(s string) (time.Time, bool) {
-	if s == "" {
-		return time.Time{}, false
-	}
-	i, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return time.Unix(i, 0).UTC(), true
-}
-
-// getTranslationsCached:
-// 1) prova Redis (best-effort)
-// 2) se Redis non disponibile o miss: prova S3 latest (best-effort)
-// 3) se S3 non disponibile o miss: prova Tolgee (timeout 10s)
-// 4) se Tolgee va ok: salva Redis + crea nuova versione su S3 + aggiorna latest (best-effort)
-// 5) se tutto fallisce: ritorna JSON vuoto
+// getTranslationsCached keeps Redis first, then S3 latest, then Tolgee; writes back to Redis and S3 when fetched from Tolgee.
 func getTranslationsCached(ctx context.Context, s3c *s3Client, appID, lang string, nested bool, force bool) ([]byte, error) {
 	mode := "flat"
 	if nested {
@@ -321,7 +305,7 @@ func getTranslationsCached(ctx context.Context, s3c *s3Client, appID, lang strin
 		log.Printf("[cache][tolgee] GET export url=%q ak=%q lang=%q nested=%v", tolgeeURL, tolgeeAK, lang, nested)
 
 		client := resty.New().
-			SetTimeout(10 * time.Second).
+			SetTimeout(0).
 			SetRetryCount(0)
 
 		req := client.R().
@@ -384,12 +368,7 @@ func getTranslationsCached(ctx context.Context, s3c *s3Client, appID, lang strin
 	return bb, nil
 }
 
-// getLanguagesCached:
-// 1) prova Redis (best-effort)
-// 2) se Redis non disponibile o miss: prova S3 latest (best-effort)
-// 3) se S3 non disponibile o miss: prova Tolgee (timeout 10s)
-// 4) se Tolgee va ok: salva Redis + crea nuova versione su S3 + aggiorna latest (best-effort)
-// 5) se tutto fallisce: ritorna JSON vuoto
+// getLanguagesCached keeps Redis first, then S3 latest, then Tolgee; writes back to Redis and S3 when fetched from Tolgee.
 func getLanguagesCached(ctx context.Context, s3c *s3Client, appID string) ([]byte, error) {
 	redisKey := "languages:" + appID
 	fetchedAtKey := redisKey + redisFetchedAtSuffix
@@ -447,7 +426,7 @@ func getLanguagesCached(ctx context.Context, s3c *s3Client, appID string) ([]byt
 		log.Printf("[cache][tolgee] GET languages url=%q ak=%q", url, tolgeeAK)
 
 		client := resty.New().
-			SetTimeout(10 * time.Second).
+			SetTimeout(0).
 			SetRetryCount(0)
 
 		resp, e := client.R().
@@ -505,6 +484,19 @@ type tolgeeLanguage struct {
 	Tag string `json:"tag"`
 }
 
+// tolgeeLanguagesEnvelope supports both direct array and _embedded.languages formats.
+type tolgeeLanguagesEnvelope struct {
+	Embedded struct {
+		Languages []tolgeeLanguage `json:"languages"`
+	} `json:"_embedded"`
+	Languages []tolgeeLanguage `json:"languages"`
+}
+
+type tolgeeSignatureHeader struct {
+	Timestamp int64  `json:"timestamp"`
+	Signature string `json:"signature"`
+}
+
 type updateSummary struct {
 	App        string   `json:"app"`
 	Languages  []string `json:"languages"`
@@ -514,59 +506,97 @@ type updateSummary struct {
 	FinishedAt string   `json:"finished_at"`
 }
 
-type tolgeeSignatureHeader struct {
-	Timestamp int64  `json:"timestamp"`
-	Signature string `json:"signature"`
+// Single-app helpers
+func getTolgeeAppKey() string {
+	return strings.TrimSpace(localenv.GetTolgeeAppKey())
 }
 
-type idMappings struct {
-	appIDs    map[string]string
-	appSecret map[string]string
+func normalizeLang(tag string) string {
+	tag = strings.TrimSpace(tag)
+	tag = strings.ToLower(tag)
+	return tag
 }
 
-func parseMappings(raw string) map[string]string {
-	m := make(map[string]string)
-	if raw == "" {
-		return m
+func availableLanguagesFromPayload(payload []byte) []string {
+	var out []string
+	if len(payload) == 0 {
+		return out
 	}
-	parts := strings.Split(raw, ",")
+
+	// Try direct array format
+	var direct []tolgeeLanguage
+	if err := json.Unmarshal(payload, &direct); err == nil && len(direct) > 0 {
+		for _, l := range direct {
+			tag := normalizeLang(l.Tag)
+			if tag != "" {
+				out = append(out, tag)
+			}
+		}
+		return out
+	}
+
+	// Try Tolgee envelope
+	var env tolgeeLanguagesEnvelope
+	if err := json.Unmarshal(payload, &env); err == nil {
+		candidates := env.Languages
+		if len(candidates) == 0 {
+			candidates = env.Embedded.Languages
+		}
+		for _, l := range candidates {
+			tag := normalizeLang(l.Tag)
+			if tag != "" {
+				out = append(out, tag)
+			}
+		}
+	}
+
+	return out
+}
+
+func parseAcceptLanguageHeader(header string) []string {
+	if header == "" {
+		return nil
+	}
+	parts := strings.Split(header, ",")
+	res := make([]string, 0, len(parts))
 	for _, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
-		kv := strings.SplitN(p, ":", 2)
-		if len(kv) != 2 {
+		lang := strings.SplitN(p, ";", 2)[0]
+		lang = normalizeLang(lang)
+		if lang != "" {
+			res = append(res, lang)
+		}
+	}
+	return res
+}
+
+func pickLanguage(preferred []string, available []string) string {
+	if len(available) == 0 {
+		return ""
+	}
+	availSet := make(map[string]struct{}, len(available))
+	for _, a := range available {
+		availSet[normalizeLang(a)] = struct{}{}
+	}
+	for _, p := range preferred {
+		p = normalizeLang(p)
+		if p == "" {
 			continue
 		}
-		key := strings.TrimSpace(kv[0])
-		val := strings.TrimSpace(kv[1])
-		if key != "" && val != "" {
-			m[key] = val
+		if _, ok := availSet[p]; ok {
+			return p
+		}
+		if idx := strings.IndexByte(p, '-'); idx > 0 {
+			base := p[:idx]
+			if _, ok := availSet[base]; ok {
+				return base
+			}
 		}
 	}
-	return m
-}
-
-func loadIDMappings() idMappings {
-	return idMappings{
-		appIDs:    parseMappings(localenv.GetAppIDsMappingRaw()),
-		appSecret: parseMappings(localenv.GetAppSecretsMappingRaw()),
-	}
-}
-
-func resolveAppID(idOrApp string, maps idMappings) (string, bool) {
-	if val, ok := maps.appIDs[idOrApp]; ok {
-		return val, true
-	}
-	return idOrApp, false
-}
-
-func resolveSecret(idOrApp string, maps idMappings) string {
-	if val, ok := maps.appSecret[idOrApp]; ok {
-		return val
-	}
-	return localenv.GetWebhookSecret()
+	return ""
 }
 
 func verifyTolgeeSignature(secret string, rawHeader string, body []byte) bool {
@@ -638,8 +668,15 @@ func refreshAppTranslations(ctx context.Context, s3c *s3Client, appID string) up
 	return summary
 }
 
+// --- Application entrypoint: single Tolgee app ---
+
 func main() {
 	rootCtx := context.Background()
+	appKey := getTolgeeAppKey()
+	if appKey == "" {
+		log.Fatal("TOLGEE_APP_KEY is required")
+	}
+
 	var s3c *s3Client
 	if localenv.GetS3Enabled() {
 		c, err := newS3ClientFromEnv(rootCtx)
@@ -653,7 +690,10 @@ func main() {
 		log.Printf("[cache][s3] disabled via env S3_ENABLED=false")
 	}
 
-	mappings := loadIDMappings()
+	// Initial warmup: languages + all translations (flat + nested)
+	log.Printf("[startup] warmup: fetching languages and translations for app=%s", appKey)
+	_ = refreshAppTranslations(rootCtx, s3c, appKey)
+	log.Printf("[startup] warmup done")
 
 	app := fiber.New(fiber.Config{
 		JSONEncoder: json.Marshal,
@@ -669,60 +709,134 @@ func main() {
 		return err
 	})
 
-	app.Get("/healthz", func(c *fiber.Ctx) error {
-		return c.Status(200).SendString("ok")
-	})
+	app.Get("/api/healthz", makeHealthHandler())
+	app.All("/api/update", makeUpdateHandler(appKey, s3c))
+	app.Get("/api/languages", makeLanguagesHandler(appKey, s3c))
+	app.Get("/api/:lang", makeTranslationsHandler(appKey, s3c))
 
-	app.All("/api/:app/update", func(c *fiber.Ctx) error {
-		appParam := c.Params("app")
-		appID, mapped := resolveAppID(appParam, mappings)
-		if !mapped {
-			return c.Status(http.StatusBadRequest).JSON(fiber.Map{"error": "updates allowed only for numeric mapped ids"})
-		}
-		secret := resolveSecret(appParam, mappings)
+	// Catch-all 404: return inferred language (or en) payload
+	app.All("*", makeFallbackHandler(appKey, s3c))
+
+	log.Fatal(app.Listen(":3000"))
+}
+
+// --- Handlers ---
+
+func makeHealthHandler() fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		return c.Status(http.StatusOK).SendString("ok")
+	}
+}
+
+func makeUpdateHandler(appKey string, s3c *s3Client) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		secret := localenv.GetWebhookSecret()
 		header := c.Get("Tolgee-Signature")
 		body := c.Body()
 		if !verifyTolgeeSignature(secret, header, body) {
+			log.Printf("[webhook] reject: invalid signature")
 			return c.Status(http.StatusUnauthorized).JSON(fiber.Map{"error": "invalid webhook signature"})
 		}
-
-		summary := refreshAppTranslations(c.Context(), s3c, appID)
+		log.Printf("[webhook] accepted -> refresh app=%s", appKey)
+		summary := refreshAppTranslations(c.Context(), s3c, appKey)
 		return c.Status(http.StatusOK).JSON(summary)
-	})
+	}
+}
 
-	app.Get("/api/:app", func(c *fiber.Ctx) error {
-		appParam := c.Params("app")
-		appID, _ := resolveAppID(appParam, mappings)
-
-		data, err := getLanguagesCached(c.Context(), s3c, appID)
+func makeLanguagesHandler(appKey string, s3c *s3Client) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		data, err := getLanguagesCached(c.Context(), s3c, appKey)
 		if err != nil {
+			log.Printf("[api][languages] error: %v", err)
+		}
+		if err != nil || len(data) == 0 {
+			log.Printf("[api][languages] returning empty payload")
 			data = []byte("{}")
 		}
-
 		c.Set("Content-type", "application/json; charset=utf-8")
-		return c.Status(200).Send(data)
-	})
-	app.Get("/api/:app/:lang", func(c *fiber.Ctx) error {
-		appParam := c.Params("app")
-		appID, _ := resolveAppID(appParam, mappings)
-		lang := c.Params("lang")
+		return c.Status(http.StatusOK).Send(data)
+	}
+}
 
+func makeTranslationsHandler(appKey string, s3c *s3Client) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		requested := normalizeLang(c.Params("lang"))
 		nested := false
 		if raw := c.Query("nested", "false"); raw != "" {
-			b, perr := strconv.ParseBool(raw)
-			if perr == nil {
+			if b, perr := strconv.ParseBool(raw); perr == nil {
 				nested = b
 			}
 		}
 
-		data, err := getTranslationsCached(c.Context(), s3c, appID, lang, nested, false)
-		if err != nil {
+		langsPayload, _ := getLanguagesCached(c.Context(), s3c, appKey)
+		available := availableLanguagesFromPayload(langsPayload)
+		preferred := parseAcceptLanguageHeader(c.Get("Accept-Language"))
+
+		target := requested
+		if target == "" {
+			target = pickLanguage(preferred, available)
+			log.Printf("[api][translations] infer target from Accept-Language=%v -> %s", preferred, target)
+		}
+		if target == "" || !containsLang(available, target) {
+			fallback := pickLanguage(preferred, available)
+			if fallback == "" {
+				fallback = "en"
+			}
+			log.Printf("[api][translations] fallback target=%s (requested=%s available=%v)", fallback, requested, available)
+			target = fallback
+		}
+
+		data, err := getTranslationsCached(c.Context(), s3c, appKey, target, nested, false)
+		if (err != nil || len(data) == 0) && target != "en" {
+			log.Printf("[api][translations] fallback to en due to err=%v target=%s", err, target)
+			data, _ = getTranslationsCached(c.Context(), s3c, appKey, "en", nested, false)
+			target = "en"
+		}
+		if data == nil {
+			log.Printf("[api][translations] returning empty payload target=%s", target)
 			data = []byte("{}")
 		}
 
 		c.Set("Content-type", "application/json; charset=utf-8")
-		return c.Status(200).Send(data)
-	})
+		c.Set("Content-Language", target)
+		return c.Status(http.StatusOK).Send(data)
+	}
+}
 
-	log.Fatal(app.Listen(":3000"))
+func makeFallbackHandler(appKey string, s3c *s3Client) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		langsPayload, _ := getLanguagesCached(c.Context(), s3c, appKey)
+		available := availableLanguagesFromPayload(langsPayload)
+		preferred := parseAcceptLanguageHeader(c.Get("Accept-Language"))
+
+		target := pickLanguage(preferred, available)
+		if target == "" {
+			target = "en"
+		}
+
+		data, err := getTranslationsCached(c.Context(), s3c, appKey, target, false, false)
+		if (err != nil || len(data) == 0) && target != "en" {
+			data, _ = getTranslationsCached(c.Context(), s3c, appKey, "en", false, false)
+			target = "en"
+		}
+		if data == nil {
+			data = []byte("{}")
+		}
+
+		log.Printf("[api][fallback] 404 path=%s -> lang=%s", c.Path(), target)
+		c.Set("Content-type", "application/json; charset=utf-8")
+		c.Set("Content-Language", target)
+		return c.Status(http.StatusNotFound).Send(data)
+	}
+}
+
+// containsLang checks normalized presence in available slice.
+func containsLang(available []string, lang string) bool {
+	lang = normalizeLang(lang)
+	for _, a := range available {
+		if normalizeLang(a) == lang {
+			return true
+		}
+	}
+	return false
 }
