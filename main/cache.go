@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	localenv "mensalocalizations/tools/env"
 )
@@ -115,20 +116,8 @@ func GetTranslationsFromCache(ctx context.Context, lang string, nested bool) ([]
 		}
 	}
 
-	i, err := GetTranslations(ctx, localenv.GetTolgeeAppKey(), lang, nested)
-	if err != nil || i[lang] == nil || len(i[lang]) == 0 {
-		if lang != "en" {
-			log.Printf("[cache] missing translations for lang=%q, falling back to en", lang)
-			return GetTranslationsFromCache(ctx, "en", nested)
-		} else {
-			return nil, err
-		}
+	if lang == "en" {
+		return nil, errors.New("english translations not found in cache")
 	}
-
-	_ = redisPut(ctx, "tolgee:lang:"+lang+":"+nestedStr, i[lang], 0)
-	if s3c != nil {
-		_ = s3c.putObject(ctx, "tolgee:lang:"+lang+":"+nestedStr, i[lang], "application/json", map[string]string{})
-	}
-
-	return i[lang], nil
+	return GetTranslationsFromCache(ctx, "en", nested)
 }
