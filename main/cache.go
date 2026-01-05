@@ -104,7 +104,6 @@ func GetTranslationsFromCache(ctx context.Context, lang string, nested bool) ([]
 		c, err := newS3ClientFromEnv(ctx)
 		if err != nil {
 			log.Printf("[cache][s3] disabled (config error): %v", err)
-
 		} else {
 			log.Printf("[cache][s3] enabled bucket=%q", c.bucket)
 			s3c = c
@@ -117,12 +116,13 @@ func GetTranslationsFromCache(ctx context.Context, lang string, nested bool) ([]
 	}
 
 	i, err := GetTranslations(ctx, localenv.GetTolgeeAppKey(), lang, nested)
-	if err != nil {
-		i2, err := GetTranslations(ctx, localenv.GetTolgeeAppKey(), "en", nested)
-		if err != nil {
+	if err != nil || i[lang] == nil || len(i[lang]) == 0 {
+		if lang != "en" {
+			log.Printf("[cache] missing translations for lang=%q, falling back to en", lang)
+			return GetTranslationsFromCache(ctx, "en", nested)
+		} else {
 			return nil, err
 		}
-		return i2["en"], nil
 	}
 
 	_ = redisPut(ctx, "tolgee:lang:"+lang+":"+nestedStr, i[lang], 0)
