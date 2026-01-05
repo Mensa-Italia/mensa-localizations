@@ -24,7 +24,6 @@ func main() {
 	app := fiber.New(fiber.Config{
 		JSONEncoder: json.Marshal,
 		JSONDecoder: json.Unmarshal,
-		Prefork:     true,
 	})
 
 	app.Use(func(c *fiber.Ctx) error {
